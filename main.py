@@ -7,37 +7,120 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CallbackContext, InlineQueryHandler, CallbackQueryHandler, MessageHandler, filters
 from pymongo import MongoClient
 
-from config import settings, LANGUAGES
-from db import db
-
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize bot
-application = Application.builder().token(settings.BOT_TOKEN).build()
+# Get environment variables with defaults
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+MONGODB_URI = os.getenv("MONGODB_URI", "").strip()
+WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").strip()
+DEFAULT_LANG = os.getenv("DEFAULT_LANG", "en").strip()
+
+admin_ids = os.getenv("ADMIN_IDS", "").strip()
+ADMIN_IDS = [int(id.strip()) for id in admin_ids.split(",") if id.strip()]
+
+# Debug info
+logger.info("🔧 Environment Variables:")
+logger.info(f"BOT_TOKEN: {'✅ Set' if BOT_TOKEN else '❌ Missing'}")
+logger.info(f"MONGODB_URI: {'✅ Set' if MONGODB_URI else '❌ Missing'}")
+logger.info(f"WEBHOOK_BASE_URL: {'✅ Set' if WEBHOOK_BASE_URL else '❌ Missing'}")
+logger.info(f"ADMIN_IDS: {ADMIN_IDS}")
+
+if not BOT_TOKEN:
+    logger.error("❌ BOT_TOKEN is required!")
+if not MONGODB_URI:
+    logger.error("❌ MONGODB_URI is required!")
+if not WEBHOOK_BASE_URL:
+    logger.error("❌ WEBHOOK_BASE_URL is required!")
+
+LANGUAGES = {
+    "en": {
+        "usage": "Usage: @BotUsername secret_text @username",
+        "whisper_placeholder": "🔒 A whisper message to {target_username} — Only they can open it.",
+        "show_message": "show message 🔒",
+        "secret_sent": "Secret sent to your DM 🔐",
+        "not_for_you": "This whisper is only for @{target_username}",
+        "admin_copy": "📨 New Whisper\nFrom: @{from_username}\nTo: @{target_username}\nTime: {time}"
+    }
+}
+
+# Initialize bot only if token is available
+if BOT_TOKEN:
+    application = Application.builder().token(BOT_TOKEN).build()
+else:
+    application = None
+    logger.error("❌ Bot cannot start without BOT_TOKEN")
+
+class Database:
+    def __init__(self):
+        self.client = None
+        self.db = None
+        self.whispers = None
+
+    def connect(self):
+        if not MONGODB_URI:
+            logger.error("❌ Cannot connect to MongoDB: MONGODB_URI not set")
+            return
+        try:
+            self.client = MongoClient(MONGODB_URI)
+            self.db = self.client.whisper_bot
+            self.whispers = self.db.whispers
+            self.whispers.create_index([("created_at", -1)])
+            logger.info("✅ Connected to MongoDB")
+        except Exception as e:
+            logger.error(f"❌ MongoDB connection failed: {e}")
+
+    def close(self):
+        if self.client:
+            self.client.close()
+
+    def create_whisper(self, from_user: dict, target_username: str, secret_text: str) -> str:
+        from bson import ObjectId
+        from datetime import datetime
+        
+        if not self.whispers:
+            return "demo_whisper_id"
+            
+        whisper_id = str(ObjectId())
+        whisper_data = {
+            "whisper_id": whisper_id,
+            "from_user": from_user,
+            "target_username": target_username.lower().replace("@", ""),
+            "secret_text": secret_text,
+            "created_at": datetime.utcnow(),
+            "opened_at": None,
+            "opened_by": None
+        }
+        self.whispers.insert_one(whisper_data)
+        return whisper_id
+
+    def get_whisper(self, whisper_id: str):
+        if not self.whispers:
+            return None
+        return self.whispers.find_one({"whisper_id": whisper_id})
+
+db = Database()
 
 async def handle_inline_query(update: Update, context: CallbackContext):
+    if not application:
+        return
+        
     query = update.inline_query.query.strip()
     user = update.inline_query.from_user
-    user_lang = user.language_code or settings.DEFAULT_LANG
-    if user_lang not in LANGUAGES:
-        user_lang = settings.DEFAULT_LANG
+    user_lang = user.language_code or DEFAULT_LANG
     
-    # Parse query: "secret message @username"
+    # Parse query
     pattern = r'^(.*?)\s*@(\w+)$'
     match = re.match(pattern, query)
     
     if not match or not query:
-        # Show usage help
         await update.inline_query.answer([{
             'type': 'article',
             'id': 'help',
             'title': 'Whisper Bot Usage',
-            'input_message_content': {
-                'message_text': LANGUAGES[user_lang]["usage"]
-            },
-            'description': LANGUAGES[user_lang]["usage"]
+            'input_message_content': {'message_text': LANGUAGES["en"]["usage"]},
+            'description': LANGUAGES["en"]["usage"]
         }], cache_time=1)
         return
     
@@ -49,14 +132,12 @@ async def handle_inline_query(update: Update, context: CallbackContext):
             'type': 'article',
             'id': 'error',
             'title': 'Empty Message',
-            'input_message_content': {
-                'message_text': LANGUAGES[user_lang]["usage"]
-            },
+            'input_message_content': {'message_text': LANGUAGES["en"]["usage"]},
             'description': 'Please provide a secret message'
         }], cache_time=1)
         return
     
-    # Create whisper in database
+    # Create whisper
     from_user = {
         "id": user.id,
         "username": user.username,
@@ -66,63 +147,33 @@ async def handle_inline_query(update: Update, context: CallbackContext):
     
     whisper_id = db.create_whisper(from_user, target_username, secret_text)
     
-    # Send admin copy
-    await send_admin_copy(from_user, target_username, secret_text, user_lang)
-    
     # Create inline keyboard
-    keyboard = [[InlineKeyboardButton(
-        LANGUAGES[user_lang]["show_message"], 
-        callback_data=f"show_{whisper_id}"
-    )]]
+    keyboard = [[InlineKeyboardButton("show message 🔒", callback_data=f"show_{whisper_id}")]]
     
     await update.inline_query.answer([{
         'type': 'article',
         'id': whisper_id,
         'title': f'Whisper to @{target_username}',
         'input_message_content': {
-            'message_text': LANGUAGES[user_lang]["whisper_placeholder"].format(
-                target_username=target_username
-            )
+            'message_text': f"🔒 A whisper message to {target_username} — Only they can open it."
         },
         'reply_markup': InlineKeyboardMarkup(keyboard),
         'description': 'Click to send whisper'
     }], cache_time=1)
 
-async def send_admin_copy(from_user: dict, target_username: str, secret_text: str, lang: str):
-    admin_message = LANGUAGES[lang]["admin_copy"].format(
-        from_username=from_user.get("username", "No username"),
-        target_username=target_username,
-        time=datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    )
-    
-    admin_message += f"\nMessage: {secret_text}"
-    
-    for admin_id in settings.ADMIN_IDS:
-        try:
-            await application.bot.send_message(admin_id, admin_message)
-        except Exception as e:
-            logger.error(f"Failed to send admin copy to {admin_id}: {e}")
-
 async def handle_callback_query(update: Update, context: CallbackContext):
     query = update.callback_query
     whisper_id = query.data.replace("show_", "")
     user = query.from_user
-    user_lang = user.language_code or settings.DEFAULT_LANG
-    if user_lang not in LANGUAGES:
-        user_lang = settings.DEFAULT_LANG
     
-    # Find whisper in database
     whisper = db.get_whisper(whisper_id)
     
     if not whisper:
-        await query.answer("Whisper not found or expired", show_alert=True)
+        await query.answer("Whisper not found", show_alert=True)
         return
     
     target_username = whisper["target_username"]
-    
-    # Check if user is the target
-    is_target = (user.username and 
-                user.username.lower() == target_username.lower())
+    is_target = (user.username and user.username.lower() == target_username.lower())
     
     if is_target:
         try:
@@ -130,51 +181,45 @@ async def handle_callback_query(update: Update, context: CallbackContext):
                 user.id,
                 f"🔓 Secret message from @{whisper['from_user'].get('username', 'Unknown')}:\n\n{whisper['secret_text']}"
             )
-            db.mark_whisper_opened(whisper_id, user.id)
-            await query.answer(LANGUAGES[user_lang]["secret_sent"])
-        except Exception as e:
+            await query.answer("Secret sent to your DM 🔐")
+        except Exception:
             await query.answer("Please start a DM with me first", show_alert=True)
     else:
-        await query.answer(
-            LANGUAGES[user_lang]["not_for_you"].format(target_username=target_username),
-            show_alert=True
-        )
+        await query.answer(f"This whisper is only for @{target_username}", show_alert=True)
 
-async def handle_start(update: Update, context: CallbackContext):
-    await update.message.reply_text(
-        "🤫 Welcome to Whisper Bot!\n\n"
-        "Send secret messages in any chat using inline mode:\n\n"
-        "Type: @BotUsername your_message @target_user\n\n"
-        "Example: @BotUsername Hello, this is secret! @username"
-    )
+# Add handlers only if application exists
+if application:
+    application.add_handler(InlineQueryHandler(handle_inline_query))
+    application.add_handler(CallbackQueryHandler(handle_callback_query, pattern="^show_"))
 
-# Add handlers
-application.add_handler(InlineQueryHandler(handle_inline_query))
-application.add_handler(CallbackQueryHandler(handle_callback_query, pattern="^show_"))
-application.add_handler(MessageHandler(filters.COMMAND & filters.Regex("^/start"), handle_start))
-
-# FastAPI app
 app = FastAPI(title="Telegram Whisper Bot")
 
 @app.on_event("startup")
 async def on_startup():
-    # Connect to database
     db.connect()
-    
-    # Set webhook
-    webhook_url = f"{settings.WEBHOOK_BASE_URL}/webhook"
-    await application.bot.set_webhook(webhook_url)
-    logger.info(f"Webhook set to: {webhook_url}")
+    if application and WEBHOOK_BASE_URL:
+        webhook_url = f"{WEBHOOK_BASE_URL}/webhook"
+        await application.bot.set_webhook(webhook_url)
+        logger.info(f"✅ Webhook set to: {webhook_url}")
+    else:
+        logger.warning("⚠️  Bot not fully configured")
 
 @app.post("/webhook")
 async def webhook_handler(request: Request):
+    if not application:
+        return {"status": "bot not configured"}
+    
     update = Update.de_json(await request.json(), application.bot)
     await application.process_update(update)
     return {"status": "ok"}
 
 @app.get("/")
 async def root():
-    return {"status": "Bot is running", "service": "Telegram Whisper Bot"}
+    return {
+        "status": "Bot is running" if BOT_TOKEN else "Bot not configured",
+        "bot_configured": bool(BOT_TOKEN),
+        "database_configured": bool(MONGODB_URI)
+    }
 
 @app.get("/health")
 async def health_check():
