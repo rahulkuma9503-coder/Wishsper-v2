@@ -3,16 +3,28 @@ from typing import List
 
 class Settings:
     def __init__(self):
-        self.BOT_TOKEN = os.getenv("BOT_TOKEN")
-        self.MONGODB_URI = os.getenv("MONGODB_URI")
-        self.WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL")
-        self.DEFAULT_LANG = os.getenv("DEFAULT_LANG", "en")
+        self.BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+        self.MONGODB_URI = os.getenv("MONGODB_URI", "").strip()
+        self.WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").strip()
+        self.DEFAULT_LANG = os.getenv("DEFAULT_LANG", "en").strip()
         
-        admin_ids = os.getenv("ADMIN_IDS", "")
+        admin_ids = os.getenv("ADMIN_IDS", "").strip()
         self.ADMIN_IDS = [int(id.strip()) for id in admin_ids.split(",") if id.strip()]
         
-        if not all([self.BOT_TOKEN, self.MONGODB_URI, self.WEBHOOK_BASE_URL]):
-            raise ValueError("Missing required environment variables")
+        # Debug information
+        print("🔧 Environment Variables Check:")
+        print(f"BOT_TOKEN: {'✅ Set' if self.BOT_TOKEN else '❌ Missing'}")
+        print(f"MONGODB_URI: {'✅ Set' if self.MONGODB_URI else '❌ Missing'}")
+        print(f"WEBHOOK_BASE_URL: {'✅ Set' if self.WEBHOOK_BASE_URL else '❌ Missing'}")
+        print(f"ADMIN_IDS: {self.ADMIN_IDS}")
+        
+        # Validate required environment variables
+        if not self.BOT_TOKEN:
+            raise ValueError("❌ BOT_TOKEN is required")
+        if not self.MONGODB_URI:
+            raise ValueError("❌ MONGODB_URI is required")
+        if not self.WEBHOOK_BASE_URL:
+            raise ValueError("❌ WEBHOOK_BASE_URL is required")
 
 settings = Settings()
 
